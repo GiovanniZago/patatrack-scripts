@@ -213,7 +213,8 @@ class Slot:
     def get_execution_parameters(self):
         command = []
         environ = {}
-        if self.numa_cpu is not None or self.numa_mem is not None or self.cpus is not None:
+        # if self.numa_cpu is not None or self.numa_mem is not None or self.cpus is not None:
+        if 0:
             command = ['numactl']
             if self.numa_cpu is not None:
                 command += [ '-N', ','.join(map(str, self.numa_cpu)) ]

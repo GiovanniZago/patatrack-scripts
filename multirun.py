@@ -548,7 +548,7 @@ def multiCmsRun(
       os.mkdir(jobdir)
       if daqdir is not None:
         if daqdir.startswith('/'):
-          os.makedirs(daqdir, exists_ok = True)
+          os.makedirs(daqdir, exist_ok = True)
         else:
           os.makedirs(os.path.join(jobdir, daqdir))
       job_threads[job] = singleCmsRun(
@@ -637,7 +637,7 @@ def multiCmsRun(
       os.mkdir(jobdir)
       if daqdir is not None:
         if daqdir.startswith('/'):
-          os.makedirs(daqdir, exists_ok = True)
+          os.makedirs(daqdir, exist_ok = True)
         else:
           os.makedirs(os.path.join(jobdir, daqdir))
       job_threads[job] = singleCmsRun(
