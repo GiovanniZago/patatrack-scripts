@@ -4,6 +4,7 @@ import sys
 import os
 import copy
 import io
+import shlex
 import shutil
 import subprocess
 
@@ -75,7 +76,13 @@ def unique_name(name, used, split_ext = False):
 
 if __name__ == "__main__":
   parser = OptionParser()
+  parser.parser.add_argument('--config-arg', action='append', default=[], metavar='ARG',
+      help='pass ARG to each original CMSSW configuration while loading it; repeat for each argument')
+  parser.parser.add_argument('--reproducible-logs', action='store_true',
+      help='keep only the runnable benchmark config and record each job command in cmsRun_commands.txt')
   opts = parser.parse(sys.argv[1:])
+  if opts.reproducible_logs and not opts.logdir:
+    parser.parser.error('--reproducible-logs requires a log directory')
 
   # --no-nvidia-mps: never start NVIDIA MPS, and refuse to run if a control daemon is already active
   if opts.no_nvidia_mps:
@@ -129,7 +136,7 @@ if __name__ == "__main__":
       config_log = io.StringIO() if opts.output_log else None
       if config_log is not None:
         sys.stdout = Tee(real_stdout, config_log)
-      process = parseProcess(config)
+      process = parseProcess(config, opts.config_arg)
       stem = configStem(config)
 
       # the --gpus tag is constant across this configuration's setups; leave it (and the per-setup
@@ -143,7 +150,8 @@ if __name__ == "__main__":
       # setup, so this avoids regenerating them (and re-running a short cmsRun) for every setup
       io_process = None
       if opts.input_benchmark:
-        collections = resolve_input_collections(config, opts.input_collections, opts.input_xml, opts.input_xml_events, opts.executable)
+        collections = resolve_input_collections(config, opts.input_collections, opts.input_xml, opts.input_xml_events,
+                                                opts.executable, config_args = opts.config_arg)
         io_process = make_io_process(process, collections)
       if config_log is not None:
         sys.stdout = real_stdout
@@ -181,8 +189,8 @@ if __name__ == "__main__":
         if multi and run_csv is not None:
           run_csv = unique_name(run_csv, used_csvs, split_ext = True)
 
-        # keep a copy of the configuration file in the log directory, so each run records what it ran
-        if run_logdir is not None:
+        # Reproducible logs use the final runnable config as the sole full config in the output.
+        if run_logdir is not None and not opts.reproducible_logs:
           os.makedirs(run_logdir, exist_ok = True)
           shutil.copy(config, run_logdir)
 
@@ -198,10 +206,12 @@ if __name__ == "__main__":
 
           # common options for multirun
           options = build_options(opts, jobs, threads, streams, logdir = run_logdir, data = data, header = opts.csvheader)
-          # record, next to the copied original config, the fully-expanded dump multiCmsRun actually
-          # runs; multiCmsRun writes it as "<config-stem>_dump.py" once the per-setup customisations
-          # are applied (only when it has a logdir, so the input-only warm-up run does not)
           options['source_config'] = config
+          if opts.reproducible_logs:
+            options['command_header'] = (
+              '# Benchmark invocation: ' + shlex.join(sys.argv) + '\n'
+              '# Original config and arguments: ' + shlex.join([config, *opts.config_arg]) + '\n'
+            )
 
           # one resource monitor spanning every phase of this run (I/O warm-up through the last
           # repetition), so <logdir>/cpu_monitor.csv and gpu_monitor.csv form a single continuous
@@ -233,7 +243,8 @@ if __name__ == "__main__":
             # monitor keeps sampling so the I/O phase appears in the continuous top-level CSVs. When
             # there is no shared monitor (indefinite / not surfaceable) it stays an unmonitored run
             print('Benchmarking only the input')
-            io_options = dict(options, repeats = opts.input_benchmark, logdir = None, keep = [], data = None,
+            io_logdir = os.path.join(run_logdir, 'input') if opts.reproducible_logs else None
+            io_options = dict(options, repeats = opts.input_benchmark, logdir = io_logdir, keep = [], data = None,
                               monitor = run_monitor,
                               host_monitoring = options['host_monitoring'] if run_monitor else HostMonitorInfo.NONE,
                               gpu_monitoring = run_monitor.level if run_monitor else GpuMonitorInfo.NONE)

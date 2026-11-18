@@ -14,6 +14,7 @@ import itertools
 import math
 import psutil
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1382,24 +1383,27 @@ def finish_run_monitor(monitor, logdir, plumbing):
     pass
 
 
-@threaded
-def singleCmsRun(filename, workdir, logdir = None, keep = [], autodelete = [], autodelete_delay = 60., verbose = False, debug_logs = False, slot = None, executable = 'cmsRun', environ = None, ignore_errors = False, *args):
+def singleCmsRun(filename, workdir, logdir = None, keep = [], autodelete = [], autodelete_delay = 60., verbose = False, debug_logs = False, slot = None, executable = 'cmsRun', environ = None, ignore_errors = False, *args, command_file = None):
   if slot is None:
       slot = Slot()
 
-  # if the slot requires a custom number of events, create a copy of the input file and update it accordingly
+  # For replay, keep slot-specific overrides in a small config that loads the shared dump.
   if slot.events is not None:
-    # create a new configuration file
-    oldfilename = filename
-    filename = workdir + '/process.py'
-    with open(oldfilename, 'r') as oldfile, open(filename, 'w') as newfile:
-      # copy the original content to the new configuration file
-      oldfile.seek(0)
-      newfile.write(oldfile.read())
-      # update the number of events in the temporary file
-      newfile.write(f'\n# update the number of events to process\nprocess.maxEvents.input = cms.untracked.int32({slot.events})\n')
+    if command_file is None:
+      with open(filename, encoding='utf-8') as base:
+        config_text = base.read()
+      filename = os.path.join(workdir, 'process.py')
+    else:
+      config_text = (
+        'import runpy\nimport FWCore.ParameterSet.Config as cms\n'
+        f'process = runpy.run_path({filename!r})["process"]\n'
+      )
+      filename = os.path.splitext(filename)[0] + f'_events{slot.events}.py'
+    with open(filename, 'w', encoding='utf-8') as override:
+      override.write(config_text)
+      override.write(f'\nprocess.maxEvents.input = cms.untracked.int32({slot.events})\n')
       if slot.events > -1:
-        newfile.write(f'process.ThroughputService.eventRange = cms.untracked.uint32({slot.events})\n')
+        override.write(f'process.ThroughputService.eventRange = cms.untracked.uint32({slot.events})\n')
 
   # command to execute
   command = [ executable, filename ] + list(args)
@@ -1423,6 +1427,23 @@ def singleCmsRun(filename, workdir, logdir = None, keep = [], autodelete = [], a
   if slot_prefix or slot_env:
       cmdline = slot.get_command_line_prefix() + cmdline
 
+  if command_file is not None:
+    # Include GPU settings inherited from the benchmark (e.g. --gpus) as well as slot overrides.
+    gpu_vars = ('CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES',
+                'CUDA_DEVICE_ORDER', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PIPE_DIRECTORY')
+    env_args = [f'{key}={environment[key]}' for key in dict.fromkeys((*gpu_vars, *slot_env)) if key in environment]
+    replay = shlex.join((['env', *env_args] if env_args else []) + command)
+    with open(command_file, 'a', encoding='utf-8') as commands:
+      commands.write(f'\n# {os.path.basename(workdir)} (benchmark cwd: {workdir})\n')
+      commands.write(f'(cd "$(mktemp -d)" && {replay})\n')
+
+  return runCmsRun(command, environment, workdir, logdir, keep, autodelete, autodelete_delay,
+                   verbose, debug_logs, cmdline, slot, executable, ignore_errors)
+
+
+@threaded
+def runCmsRun(command, environment, workdir, logdir, keep, autodelete, autodelete_delay,
+              verbose, debug_logs, cmdline, slot, executable, ignore_errors):
   if verbose:
     #print('Running "' + ' '.join((executable, filename) + args) + '"', slot.describe())
     print(cmdline)
@@ -1579,7 +1600,7 @@ def singleCmsRun(filename, workdir, logdir = None, keep = [], autodelete = [], a
   return (tuple(events), tuple(times), monitoring_data)
 
 
-def parseProcess(filename):
+def parseProcess(filename, config_args = ()):
   # parse the given configuration file and return the `process` object it defines.
   #
   # Each configuration is parsed in its own interpreter (a subprocess) and only its fully-expanded
@@ -1590,18 +1611,16 @@ def parseProcess(filename):
   # import-time modifier state into the next. The flat dump has no modifiers and no _cfi/_cff imports,
   # so it is self-contained and safe to load here alongside other configs' dumps -- and it is exactly
   # what gets run anyway (multiCmsRun runs process.dumpPython()).
-  scripts_dir = os.path.dirname(os.path.abspath(__file__))
   helper = '\n'.join((
     'import sys, os',
-    'sys.path.insert(0, %r)' % scripts_dir,                   # so "common" is importable
-    'from common import loadModuleFromFile',
+    'from FWCore.ParameterSet.processFromFile import processFromFile',
     'sys.path.insert(0, os.getcwd())',                        # behave like "cmsRun file.py"
-    'open(sys.argv[2], "w").write(loadModuleFromFile("pycfg", sys.argv[1]).process.dumpPython())',
+    'open(sys.argv[2], "w").write(processFromFile(sys.argv[1], sys.argv[3:]).dumpPython())',
   ))
   fd, dumpfile = tempfile.mkstemp(prefix = 'cfgdump_', suffix = '.py')
   os.close(fd)
   try:
-    result = subprocess.run([sys.executable, '-c', helper, filename, dumpfile],
+    result = subprocess.run([sys.executable, '-c', helper, filename, dumpfile, *config_args],
                             stdout = subprocess.PIPE, stderr = subprocess.STDOUT, universal_newlines = True)
     if result.returncode != 0:
       output = (result.stdout or '').strip().splitlines()
@@ -1700,7 +1719,8 @@ def multiCmsRun(
     nvidia_mps = None,              # NVIDIA MPS active thread percentage: an integer, or <=0 to split evenly among the jobs per GPU, or None to not use NVIDIA MPS
     monitor = None,                 # a shared RunMonitor to slice per-step data from (its owner writes the continuous top-level CSVs); None to use this run's own monitor
     source_config = None,           # path to the original configuration file; when set together with logdir, the fully-expanded dump that is actually run is also saved as <logdir>/<stem>_dump.py
-    *args):                         # additional arguments passed to the executable
+    *args,                          # additional arguments passed to the executable
+    command_header = None):         # optional provenance text; use the archived config for replay
 
   # apply the requested host monitoring level; this global is read (never written) by singleCmsRun
   # and monitorResources, and is set here before any job or monitor thread starts, so there is no race
@@ -1747,18 +1767,33 @@ def multiCmsRun(
       os.makedirs(tmpdir, exist_ok = True)
       tmpdir = os.path.realpath(tmpdir)
 
-  # make a full dump of the configuration, to make changes to the number of threads, streams, etc.
+  # For replay, write the full config directly to the permanent path used by the jobs.
   workdir = tempfile.TemporaryDirectory(prefix = 'multirun', dir = tmpdir)
-  config = open(os.path.join(workdir.name, 'process.py'), 'w')
-  config.write(process.dumpPython())
-  config.close()
-
-  # also save the fully-expanded configuration next to the job logs, so each run records both the
-  # original file (copied by the caller) and the exact customised process that is run
+  config_path = os.path.join(workdir.name, 'process.py')
+  archive_path = None
   if logdir is not None and source_config is not None:
     os.makedirs(logdir, exist_ok = True)
     stem, ext = os.path.splitext(os.path.basename(source_config))
-    shutil.copy(os.path.join(workdir.name, 'process.py'), os.path.join(logdir, stem + '_dump' + ext))
+    archive_path = os.path.abspath(os.path.join(logdir, stem + '_dump' + ext))
+    if command_header is not None:
+      config_path = archive_path
+
+  with open(config_path, 'w', encoding='utf-8') as config:
+    config.write(process.dumpPython())
+  if archive_path is not None and config_path != archive_path:
+    shutil.copy(config_path, archive_path)
+
+  command_file = None
+  if command_header is not None and archive_path is not None:
+    command_file = os.path.join(logdir, 'cmsRun_commands.txt')
+    runtime = os.environ if environ is None else environ
+    with open(command_file, 'w', encoding='utf-8') as commands:
+      commands.write('# Replay using the same CMSSW runtime and input data. Each command uses a fresh working directory.\n')
+      commands.write(f'# CMSSW_BASE={runtime.get("CMSSW_BASE", "")} SCRAM_ARCH={runtime.get("SCRAM_ARCH", "")}\n')
+      commands.write(command_header)
+      commands.write(f'# Framework settings: maxEvents={events} numberOfThreads={threads} numberOfStreams={streams}\n')
+      commands.write(f'# Throughput settings: jobs={jobs} repeats={repeats} warmup={warmup} eventResolution={resolution} eventSkip={skipevents}\n')
+      commands.write('# The runnable config contains the complete CMSSW process settings.\n')
 
   if slots:
     # explicit description of the job slots
@@ -1918,7 +1953,7 @@ def multiCmsRun(
           else:
             os.makedirs(os.path.join(jobdir, daqdir))
         job_threads[job] = singleCmsRun(
-          config.name,
+          config_path,
           workdir = jobdir,
           logdir = thislogdir,
           keep = [],
@@ -1930,7 +1965,7 @@ def multiCmsRun(
           executable = executable,
           environ = environ,
           ignore_errors = ignore_errors,
-          *args)
+          *args, command_file = command_file)
 
       # start all threads
       for thread in job_threads:
@@ -2015,7 +2050,7 @@ def multiCmsRun(
           else:
             os.makedirs(os.path.join(jobdir, daqdir))
         job_threads[job] = singleCmsRun(
-          config.name,
+          config_path,
           workdir = jobdir,
           logdir = thislogdir,
           keep = keep,
@@ -2027,7 +2062,7 @@ def multiCmsRun(
           executable = executable,
           environ = environ,
           ignore_errors = ignore_errors,
-          *args)
+          *args, command_file = command_file)
 
       # start profiling the benchmark script itself
       if debug_cpu_usage:

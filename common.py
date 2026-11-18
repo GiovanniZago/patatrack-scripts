@@ -45,7 +45,7 @@ def loadModuleFromFile(name, filename):
     return module
 
 
-def generate_job_report(config, events = 10, executable = 'cmsRun', environ = None):
+def generate_job_report(config, events = 10, executable = 'cmsRun', environ = None, config_args = ()):
     """
     Run a short job over <events> events to produce a framework job report
     (jobReport.xml) describing the input collections that are read, and return
@@ -73,7 +73,7 @@ def generate_job_report(config, events = 10, executable = 'cmsRun', environ = No
         dst.write('\n# limit the number of events while generating the input job report\n')
         dst.write('process.maxEvents.input = cms.untracked.int32(%d)\n' % events)
 
-    command = [ executable, '-j', xml_path, tmpcfg ]
+    command = [ executable, '-j', xml_path, tmpcfg, *config_args ]
     env = environ.copy() if environ else os.environ.copy()
     print('Generating the input job report by running "%s"' % ' '.join(command))
     result = subprocess.run(command, cwd = workdir, env = env,
@@ -84,7 +84,7 @@ def generate_job_report(config, events = 10, executable = 'cmsRun', environ = No
     return xml_path
 
 
-def resolve_input_collections(config, input_collections, input_xml, input_xml_events = 10, executable = 'cmsRun'):
+def resolve_input_collections(config, input_collections, input_xml, input_xml_events = 10, executable = 'cmsRun', config_args = ()):
     """
     Determine the list of input collections for the input-only throughput benchmark: either the
     comma-separated --input-collections, or the ReadBranches of a framework job report given by
@@ -92,7 +92,7 @@ def resolve_input_collections(config, input_collections, input_xml, input_xml_ev
     """
     if input_xml:
         if input_xml == 'auto':
-            xml_path = generate_job_report(config, events = input_xml_events, executable = executable)
+            xml_path = generate_job_report(config, events = input_xml_events, executable = executable, config_args = config_args)
         else:
             xml_path = input_xml
         return get_read_branch_names(xml_path)
